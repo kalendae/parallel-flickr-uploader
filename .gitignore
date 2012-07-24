@@ -22,3 +22,5 @@ photosets.yml
 Gemfile.lock
 
 .idea
+*.log
+
