@@ -11,21 +11,25 @@ end
 
 require 'rubygems'
 require 'flickraw'
-require 'Photosets'
+require 'yaml'
+require 'log'
+require 'FileUtils'
+require 'photosets'
+require 'ruby-debug'
 
-
-##
-## Upload script
-##
-
-# https://github.com/hanklords/flickraw
-# http://www.flickr.com/services/api/
-# http://www.flickr.com/services/api/upload.api.html
+include Log
 
 APP_CONFIG = YAML.load_file("config.yml")['defaults']
 
-if APP_CONFIG['upload_path'].nil? or APP_CONFIG['upload_path'].empty? or !File.exists? APP_CONFIG['upload_path']
-  puts "Your config upload_path is empty or doesn't exist."
+completed_path = ARGV[2]
+upload_path = ARGV[1]
+set_name = ARGV[0]
+
+if set_name.nil? or set_name.empty? or
+    upload_path.nil? or upload_path.empty? or !File.exists? upload_path or
+    completed_path.nil? or completed_path.empty? or !File.exists? completed_path
+  puts "invalid parameters or file path"
+  puts "  usage:  ruby upload.rb <photoset_name> <upload_files_path> <completed_files_path>"
   exit
 end
 
@@ -33,63 +37,70 @@ FlickRaw.api_key = APP_CONFIG['api_key']
 FlickRaw.shared_secret = APP_CONFIG['shared_secret']
 flickr.access_token = APP_CONFIG['access_token']
 flickr.access_secret = APP_CONFIG['access_secret']
+number_of_forks = APP_CONFIG['number_of_forks'] || 6
 
 
 
-# From here you are logged:
+
 login = flickr.test.login
-puts "You are now authenticated as #{login.username}"
+log "[MAIN] You are now authenticated as #{login.username}"
 
-all_sets = Photosets.new
-Dir.glob("#{APP_CONFIG['upload_path']}/*").each do |album|
-  next if album[0] == '.'
-  album_filename = File.basename album
-  #puts "album: #{album}"
-  #puts "album filename: #{album_filename}"
-  
-  Dir.glob("#{album}/*").each do |tags|
-    #puts "tags path: #{tags}"
-    tags_filename = File.basename tags
-    #puts "tags filename: #{tags_filename}"
-    next if tags_filename[0] == '.'
-    
-    Dir.glob("#{tags}/*").each do |picture|
 
-      picture_filename = File.basename picture
-      if not APP_CONFIG['allowed_ext'].include? File.extname(picture_filename)
-        puts "- #{File.extname(picture_filename)} are not allowed for upload, file was (#{picture_filename})"
-        next
+all_sets = Photosets.new(flickr.call("flickr.photosets.getList").each(&:to_hash))
+all_files = Dir["#{upload_path}/**/*"] .select{|f|!File.directory?(f) and APP_CONFIG['allowed_ext'].include?(File.extname(f))}
+log "[MAIN] about to process #{all_files.length} files from #{upload_path} using set #{set_name}"
+#distribute based on file length so each batch is similar in size
+file_batches = []
+number_of_forks.times{file_batches << [[],0]}
+
+all_files.each do |f|
+  file_batch = file_batches.sort_by{|e| e.last}.first
+  file_batch.first << f
+  file_batch.push(file_batch.pop + File.size(f))
+end
+
+
+photo_set = nil
+pids = []
+file_batches.each_with_index do |batch,batch_index|
+  pids << Process.fork do
+    log "[WORKER-#{batch_index}] worker starting"
+    batch.first.each do |file|
+      tries = 0
+      photo_id = nil
+      file_ext = File.extname(file)
+      file_time = File.mtime(file)
+      while tries < (APP_CONFIG['retries'] || 3) and photo_id.nil?
+        tries += 1
+        begin
+          photo_id = flickr.upload_photo file
+          log("[WORKER-#{batch_index}] uploaded #{file} photo_id #{photo_id}")
+          FileUtils.move(file, completed_path)
+          log("[WORKER-#{batch_index}] moved #{file} to #{completed_path}")
+        rescue Exception => e
+          log("[WORKER-#{batch_index}] error uploading try ##{tries} #{file} due to: #{e.message}")
+        end
       end
-      
-      # exclude dotfiles
-      next if picture_filename[0] == '.'
-
-      puts "- will upload '#{picture_filename}' in album '#{album_filename}' with tags #{tags_filename.split(',')}"
-      
-      # Check if destination album exists
-      photoset = all_sets.get_set_by_title(album_filename)
-      if photoset == false
-        puts "\t couldn't find any photoset named #{album_filename}, aborting..."
-        next
-      else
-        puts "\t found photoset with id: #{photoset['id']}"
-      end
-
-      picture_path = "#{picture}".encode("UTF-8")
-      encoded_tags = tags_filename.split(',').map{ |s| 
-        s.encode("UTF-8")
-        # add quotes for multiple words tags
-        %Q/"#{s}"/ 
-      }
-      picture_id = flickr.upload_photo picture_path, :title => picture_filename, :description => "", 
-                                            :tags =>encoded_tags.join(' '), :is_public => APP_CONFIG['is_public']
-      if picture_id
-        puts "\t upload done."
-        File.unlink picture_path
-        puts "\t file picture deleted."
-        puts "\t adding picture to set #{photoset['id']}"
-        res = flickr.call "flickr.photosets.addPhoto", {'photoset_id' => photoset['id'], 'photo_id' => picture_id}
+      if !photo_id.nil?
+        begin
+          # set video taken time here
+          # find or create set
+          photo_set ||= all_sets.get_set_by_title(set_name)
+          if photo_set.nil?
+            photo_set = flickr.photosets.create(:title => set_name, :primary_photo_id => photo_id)
+            log("[WORKER-#{batch_index}] created set #{set_name} starting with photo #{photo_id}")
+          else
+            flickr.photosets.addPhoto(:photoset_id => photo_set.id, :photo_id => photo_id)
+            log("[WORKER-#{batch_index}] photo #{photo_id} added to set #{set_name}")
+          end
+        rescue Exception => e
+          log("[WORKER-#{batch_index}] error assigning set #{set_name} to #{file} due to: #{e.message}")
+        end
       end
     end
+    log("[WORKER-#{batch_index}] finished with uploading #{upload_path}")
   end
 end
+Process.waitall
+log("[MAIN] finished with uploading #{upload_path}")
+

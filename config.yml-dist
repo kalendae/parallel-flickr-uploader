@@ -5,3 +5,6 @@ defaults:
     access_secret: 
     upload_path:
     allowed_ext: ['.jpg', '.png', '.JPG']
+    number_of_forks: 5
+    log_file: upload.log
+    retries: 3

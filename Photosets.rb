@@ -3,8 +3,8 @@ require 'yaml'
 
 class Photosets
   
-  def initialize(name = 'photosets.yml')
-    @data = YAML.load(File.open(name))
+  def initialize(data)
+    @data = data
   end
   
   def get_set_by_title(title)
@@ -12,7 +12,7 @@ class Photosets
       #puts "matching #{s['title']} and #{title}"
       return s if s["title"] == title
     }
-    false
+    nil
   end
   
   def show
